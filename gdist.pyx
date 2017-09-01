@@ -189,6 +189,7 @@ def compute_gdist(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
     
     distances[distances==GEODESIC_INF] = numpy.inf
 
+    del algorithm
     return distances
 
 
