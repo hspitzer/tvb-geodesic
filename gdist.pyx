@@ -55,6 +55,10 @@ import scipy.sparse
 
 # Pre-cdef'd containers from the C++ standard library   
 from libcpp.vector cimport vector
+from libcpp cimport bool
+from libc.stdio cimport printf
+
+from cython.parallel import prange, parallel, threadid
 
 ################################################################################
 ############ Defininitions to access the C++ geodesic distance library #########
@@ -64,7 +68,7 @@ cdef extern from "geodesic_mesh_elements.h" namespace "geodesic":
         Vertex()
 
 cdef extern from "geodesic_mesh_elements.h" namespace "geodesic":
-    cdef cppclass SurfacePoint:
+    cdef cppclass SurfacePoint nogil:
         SurfacePoint()
         SurfacePoint(Vertex*)
         double& x()
@@ -72,28 +76,197 @@ cdef extern from "geodesic_mesh_elements.h" namespace "geodesic":
         double& z()
 
 cdef extern from "geodesic_mesh.h" namespace "geodesic":
-    cdef cppclass Mesh:
+    cdef cppclass Mesh nogil:
         Mesh()
         void initialize_mesh_data(vector[double]&, vector[unsigned]&)
         vector[Vertex]& vertices()
 
 cdef extern from "geodesic_algorithm_exact.h" namespace "geodesic":
-    cdef cppclass GeodesicAlgorithmExact:
+    cdef cppclass GeodesicAlgorithmExact nogil:
         GeodesicAlgorithmExact(Mesh*)
         void propagate(vector[SurfacePoint]&, double, vector[SurfacePoint]*)
         unsigned best_source(SurfacePoint&, double&)
+
+cdef extern from "geodesic_algorithm_subdivision.h" namespace "geodesic":
+    cdef cppclass GeodesicAlgorithmSubdivision nogil:
+        GeodesicAlgorithmSubdivision(Mesh*, unsigned)
+        void propagate(vector[SurfacePoint]&, double, vector[SurfacePoint]*)
+        unsigned best_source(SurfacePoint&, double&)
+
+cdef extern from "geodesic_algorithm_base.h" namespace "geodesic":
+    cdef cppclass GeodesicAlgorithmBase nogil:
+        GeodesicAlgorithmBase()
+        void propagate(vector[SurfacePoint]&, double, vector[SurfacePoint]*)
+        unsigned best_source(SurfacePoint&, double&)
+
 
 cdef extern from "geodesic_constants_and_simple_functions.h" namespace "geodesic":
     double GEODESIC_INF
 ################################################################################
 
+# Typedefintions for easier declaration of c++ vectors
+ctypedef vector[SurfacePoint] surf_vec
+ctypedef vector[surf_vec] surf_vec_vec
 
+cdef class GeodesicAlgorithm:
+
+    cdef Mesh amesh
+    cdef bool approximate
+    cdef unsigned subdivision_level
+
+    def __cinit__(self, numpy.ndarray[numpy.float64_t, ndim=2] vertices,
+                  numpy.ndarray[numpy.int32_t, ndim=2] triangles,
+                  bool approximate=False, unsigned subdivision_level=0):
+        """Python wrapper for the geodesic algorithm class. Initialization of the mesh
+        is only done once, as opposed to every call of compute_gdist.
+        Args:
+            ``vertices``: defines x,y,z coordinates of the mesh's vertices.
+            ``triangles``: defines faces of the mesh as index triplets into vertices.
+            ``subdivision_level``: 0: dijkstra, inf:exact solution
+            ``approximate``: use approximate algorithm?
+        """
+        # Define C++ vectors to contain the mesh surface components.
+        cdef vector[double] points
+        cdef vector[unsigned] faces
+    
+        # Map numpy array of mesh "vertices" to C++ vector of mesh "points" 
+        cdef numpy.float64_t coord
+        for coord in vertices.flatten():
+            points.push_back(coord)
+    
+        # Map numpy array of mesh "triangles" to C++ vector of mesh "faces" 
+        cdef numpy.int32_t indx
+        for indx in triangles.flatten():
+            faces.push_back(indx)
+        
+        # Initialize the mesh object
+        self.amesh.initialize_mesh_data(points, faces)
+
+        # set the other parameters
+        self.approximate = approximate
+        self.subdivision_level = subdivision_level 
+
+    def compute_gdist_pairs(self, numpy.ndarray[numpy.int32_t, ndim=1] source_indices,
+                            numpy.ndarray[numpy.int32_t, ndim=1] target_indices = None, 
+                            numpy.int32_t num_threads = 1):
+        """
+        Pairwise computation of geodesic distances from source_indices to target_indices. 
+        Runs in parallel, with num_threads. 
+        Args:
+            ``source_indices``: Index of the source on the mesh
+            ``target_indices``: Index of the target on the mesh (same length as source_indices is required)
+            ``num_threads``: Number of threads to speed up the computation
+        Returns:
+            numpy.ndarray((len(target_indices),)) of geodesic distances between the point pairs.
+        """
+        assert len(source_indices) == len(target_indices)
+
+        #define variables
+        cdef Py_ssize_t num_points = len(target_indices)
+        cdef numpy.ndarray[numpy.float64_t, ndim=1] distances = numpy.zeros((num_points, ), dtype=numpy.float64)
+        cdef surf_vec el = surf_vec(1)
+        cdef surf_vec_vec sources = surf_vec_vec(num_threads, el) #thread local variable
+        cdef surf_vec_vec targets = surf_vec_vec(num_threads, el) #thread local variable
+
+        cdef Py_ssize_t k
+        cdef GeodesicAlgorithmBase *algorithm
+        cdef Py_ssize_t thread_id = -1
+        with nogil, parallel(num_threads=num_threads):
+            # create algorithm object
+            if not self.approximate:
+                algorithm = <GeodesicAlgorithmBase*> new GeodesicAlgorithmExact(&self.amesh)
+            else:
+                algorithm = <GeodesicAlgorithmBase*> new GeodesicAlgorithmSubdivision(&self.amesh, self.subdivision_level)
+            # calculate distances in parallel
+            for k in prange(source_indices.shape[0]):
+                thread_id = threadid()
+                #printf("K %d Thread %d \n", (k, thread_id))
+                sources[thread_id][0] = SurfacePoint(&self.amesh.vertices()[source_indices[k]]) 
+                targets[thread_id][0] = SurfacePoint(&self.amesh.vertices()[target_indices[k]]) 
+    
+                #Propogate to the specified targets
+                algorithm.propagate(sources[thread_id], GEODESIC_INF, &targets[thread_id])
+                algorithm.best_source(targets[thread_id][0], distances[k])
+            del algorithm 
+        distances[distances==GEODESIC_INF] = numpy.inf
+        return distances
+
+    def compute_gdist(self, numpy.ndarray[numpy.int32_t, ndim=1] source_indices = None,
+                      numpy.ndarray[numpy.int32_t, ndim=1] target_indices = None,
+                      double max_distance = GEODESIC_INF):
+        """
+        This is the wrapper function for computing geodesic distance between a set 
+        of sources and targets on a mesh surface. This function takes the following arguments:
+            ``source_indices``: Index of the source on the mesh.
+            ``target_indices``: Index of the targets on the mesh.
+            ``max_distance``: Maximal distance to which the geodesic distance is 
+                calculated when propagating to the entire mesh
+        and returns a numpy.ndarray((len(target_indices), ), dtype=numpy.float64) 
+        specifying the shortest distance to the target vertices from the nearest 
+        source vertex on the mesh. If no target_indices are provided, all vertices 
+        of the mesh are considered as targets, however, in this case, specifying 
+        max_distance will limit the targets to those vertices within max_distance of
+        a source.
+    
+        """
+        # Define and create object for algorithm on that mesh
+        cdef GeodesicAlgorithmBase *algorithm
+        if not self.approximate:
+            algorithm = <GeodesicAlgorithmBase*> new GeodesicAlgorithmExact(&self.amesh)
+        else:
+            algorithm = <GeodesicAlgorithmBase*> new GeodesicAlgorithmSubdivision(&self.amesh, self.subdivision_level)
+
+        # Define a C++ vector for the source vertices
+        cdef vector[SurfacePoint] all_sources
+    
+        # Define a C++ vector for the target vertices
+        cdef vector[SurfacePoint] stop_points
+    
+        # Define a NumPy array to hold the results
+        cdef numpy.ndarray[numpy.float64_t, ndim=1] distances
+
+        cdef Py_ssize_t  k
+    
+        if source_indices is None: #Default to 0
+            source_indices = numpy.arange(0, dtype=numpy.int32)
+        # Map the NumPy sources of targets to a C++ vector
+        for k in source_indices:
+            all_sources.push_back(SurfacePoint(&self.amesh.vertices()[k]))
+
+        if target_indices is None:
+            #Propagte purely on max_distance
+            algorithm.propagate(all_sources, max_distance, NULL)
+            #Make all vertices targets, NOTE: this is inefficient in the best_source 
+            #                                 step below, but not sure how to avoid.
+            target_indices = numpy.arange(self.amesh.vertices().size(), dtype=numpy.int32)
+            # Map the NumPy array of targets to a C++ vector
+            for k in target_indices:
+                stop_points.push_back(SurfacePoint(&self.amesh.vertices()[k]))
+        else:
+            # Map the NumPy array of targets to a C++ vector
+            for k in target_indices:
+                stop_points.push_back(SurfacePoint(&self.amesh.vertices()[k]))
+            #Propogate to the specified targets
+            algorithm.propagate(all_sources, max_distance, &stop_points)
+    
+        #
+        distances = numpy.zeros((len(target_indices), ), dtype=numpy.float64)
+        for k in range(stop_points.size()):
+            algorithm.best_source(stop_points[k], distances[k])
+    
+        distances[distances==GEODESIC_INF] = numpy.inf
+        del algorithm
+        return distances
+   
 
 def compute_gdist(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
                   numpy.ndarray[numpy.int32_t, ndim=2] triangles,
                   numpy.ndarray[numpy.int32_t, ndim=1] source_indices = None,
                   numpy.ndarray[numpy.int32_t, ndim=1] target_indices = None,
-                  double max_distance = GEODESIC_INF):
+                  double max_distance = GEODESIC_INF,
+                  unsigned subdivision_level = 0,
+                  bool approximate = False
+                  ):
     """
     This is the wrapper function for computing geodesic distance between a set 
     of sources and targets on a mesh surface. This function accepts five 
@@ -102,7 +275,10 @@ def compute_gdist(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
         ``triangles``: defines faces of the mesh as index triplets into vertices.
         ``source_indices``: Index of the source on the mesh.
         ``target_indices``: Index of the targets on the mesh.
-        ``max_distance``: 
+        ``max_distance``: Maximal distance to which the geodesic distance is 
+            calculated when propagating to the entire mesh
+        ``subdivision_level``: 0: dijkstra, inf:exact solution
+        ``approximate``: use approximate algorithm?
     and returns a numpy.ndarray((len(target_indices), ), dtype=numpy.float64) 
     specifying the shortest distance to the target vertices from the nearest 
     source vertex on the mesh. If no target_indices are provided, all vertices 
@@ -127,7 +303,6 @@ def compute_gdist(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
          array([ 0.2])
     
     """
-    
     # Define C++ vectors to contain the mesh surface components.
     cdef vector[double] points
     cdef vector[unsigned] faces
@@ -146,9 +321,13 @@ def compute_gdist(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
     cdef Mesh amesh
     amesh.initialize_mesh_data(points, faces)
     
-    # Define and create object for exact algorithm on that mesh:
-    cdef GeodesicAlgorithmExact *algorithm = new GeodesicAlgorithmExact(&amesh)
-    
+    # Define and create object for algorithm on that mesh
+    cdef GeodesicAlgorithmBase *algorithm
+    if not approximate:
+        algorithm = <GeodesicAlgorithmBase*> new GeodesicAlgorithmExact(&amesh)
+    else:
+        algorithm = <GeodesicAlgorithmBase*> new GeodesicAlgorithmSubdivision(&amesh, subdivision_level)
+
     # Define a C++ vector for the source vertices
     cdef vector[SurfacePoint] all_sources
     
@@ -165,7 +344,7 @@ def compute_gdist(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
     # Map the NumPy sources of targets to a C++ vector
     for k in source_indices:
         all_sources.push_back(SurfacePoint(&amesh.vertices()[k]))
-    
+
     if target_indices is None:
         #Propagte purely on max_distance
         algorithm.propagate(all_sources, max_distance, NULL)
@@ -191,9 +370,6 @@ def compute_gdist(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
 
     del algorithm
     return distances
-
-
-
 
 def local_gdist_matrix(numpy.ndarray[numpy.float64_t, ndim=2] vertices,
                        numpy.ndarray[numpy.int32_t, ndim=2] triangles,
